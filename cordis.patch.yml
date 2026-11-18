@@ -1,4 +1,6 @@
-# dsh-skill-easy：宿主服务行，客户端模块由 dsh.client 声明
+# dsh-skill-easy：宿主服务行。
+# 客户端模块由 package.json 的 dsh.client 声明；本插件走 B 方案，保留官方 ui-skill 组，
+# 只额外注册一个属于本插件的 `/` 源，所以这里不需要禁用任何官方行。
 - insert:
     - id: dsh-skill-easy
       name: 'dsh-skill-easy'

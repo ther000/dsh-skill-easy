@@ -2,28 +2,40 @@
  * dsh-skill-easy · 文档存储
  *
  * 这份文件不依赖任何宿主包，可以单独在 Node 里跑测试：
- * `的 doc store` 是「分类 + 中文描述」的唯一真相，服务的读写都经过它。
+ * 它是「分类 + 中文描述 + 菜单状态」的唯一真相，服务的读写都经过它。
+ *
+ * v2 相比 v1 新增：技能可隐藏（hidden）、分类内可排序（order）、
+ * 记录翻译用的模型（options.translateModel）。
+ * 不做旧数据迁移——v2 用独立文件，旧 data.json 原样保留。
  *
  * @module dsh-skill-easy/store
  */
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 
-/** 数据格式版本；字段语义变化时递增，客户端据此判断要不要迁移。 */
-export const DATA_VERSION = 1
+/** 数据格式版本；字段语义变化时递增。 */
+export const DATA_VERSION = 2
 export const MAX_CATEGORIES = 40
 export const MAX_CATEGORY_NAME = 24
 export const MAX_SKILL_NAME = 128
 export const MAX_ZH = 200
+export const MAX_PROVIDER = 64
+export const MAX_MODEL = 128
 
-/** 空文档：没有分类、没有中文描述，此时客户端不改动菜单。 */
+/** 空文档：没有分类、没有中文描述，此时菜单只挂官方那份。 */
 export function emptyDocument() {
-  return { version: DATA_VERSION, rev: 0, categories: [], skills: {}, options: { menuChinese: true } }
+  return {
+    version: DATA_VERSION,
+    rev: 0,
+    categories: [],
+    skills: {},
+    options: { menuChinese: true, translateModel: null },
+  }
 }
 
 /**
  * 英文描述的短指纹，用来判断已存的中文是否过期。
- * 用 FNV-1a：客户端也要算同一个值（比对技能原文有没有变），而浏览器里没有同步的 sha256。
+ * 用 FNV-1a：客户端也要算同一个值，而浏览器里没有同步的 sha256。
  * 只用来比对相等，不需要抗碰撞。
  */
 export function hashOf(value) {
@@ -39,6 +51,14 @@ export function hashOf(value) {
 export function text(value, max) {
   if (typeof value !== 'string') return ''
   return value.length > max ? value.slice(0, max) : value
+}
+
+function normalizeTranslateModel(raw) {
+  if (raw === null || typeof raw !== 'object') return null
+  const provider = text(raw.provider, MAX_PROVIDER).trim()
+  const model = text(raw.model, MAX_MODEL).trim()
+  if (provider === '' || model === '') return null
+  return { provider, model }
 }
 
 /**
@@ -68,15 +88,17 @@ export function normalizeDocument(raw) {
   for (const [name, entry] of Object.entries(rawSkills)) {
     const key = text(name, MAX_SKILL_NAME).trim()
     if (key === '' || entry === null || typeof entry !== 'object') continue
-    const categoryId = text(entry.categoryId, 64).trim()
-    const zh = text(entry.zh, MAX_ZH).trim()
-    const srcHash = text(entry.srcHash, 32).trim()
     const next = {}
+    const categoryId = text(entry.categoryId, 64).trim()
     if (categoryId !== '' && seenIds.has(categoryId)) next.categoryId = categoryId
+    const zh = text(entry.zh, MAX_ZH).trim()
     if (zh !== '') {
       next.zh = zh
+      const srcHash = text(entry.srcHash, 32).trim()
       if (srcHash !== '') next.srcHash = srcHash
     }
+    if (entry.hidden === true) next.hidden = true
+    if (Number.isFinite(entry.order)) next.order = entry.order
     if (Object.keys(next).length > 0) skills[key] = next
   }
 
@@ -87,7 +109,10 @@ export function normalizeDocument(raw) {
     rev: Number.isFinite(source.rev) ? source.rev : 0,
     categories,
     skills,
-    options: { menuChinese: options.menuChinese !== false },
+    options: {
+      menuChinese: options.menuChinese !== false,
+      translateModel: normalizeTranslateModel(options.translateModel),
+    },
   }
 }
 

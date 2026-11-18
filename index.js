@@ -1,13 +1,13 @@
 /**
  * dsh-skill-easy · 宿主半边
  *
- * 三件事：
- * 1. 读技能目录（ctx.skills），给客户端一份可展示的清单；
- * 2. 存「分类 + 中文描述」这份用户数据（原子写 JSON）；
- * 3. 用宿主自带的 translator 服务批量翻译英文描述。
+ * 四件事：
+ * 1. 冷读技能目录（agentPresets.acquireScope 遍历所有预设 + 全局层），给客户端完整并集；
+ * 2. 存「分类 + 中文描述 + 隐藏/排序 + 翻译模型」这份用户数据（原子写 JSON）；
+ * 3. 用宿主 ctx.llm 调用用户已配置的大模型批量翻译英文描述（不碰 API key）；
+ * 4. 把上面这些通过 Remote 暴露给客户端。
  *
- * 数据落在 ~/.dsh/storages/dsh-skill-easy/data.json，和插件本身解耦：
- * 卸载插件不会删数据，重装即恢复。
+ * 数据落在 ~/.dsh/storages/dsh-skill-easy/data.v2.json（v2 独立文件，不读旧 data.json）。
  *
  * @module dsh-skill-easy
  */
@@ -17,12 +17,16 @@ import { TypertRemoteService, Remote } from '@deepseek-ai/dsh-typert-protocol'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { DocumentStore, emptyDocument, hashOf, text, MAX_ZH } from './store.js'
 
-/** 翻译目标语言；translator 内部会把 zh-CN 归一成各 provider 的写法。 */
-const TARGET_LANGUAGE = 'zh-CN'
-/** 翻译并发：provider 是公开机器翻译接口，压太高容易被限流。 */
-const TRANSLATE_CONCURRENCY = 3
 /** 代码版本号：界面上会显示，用来确认跑的是哪一版。 */
-const CODE_VERSION = 9
+const CODE_VERSION = 1
+/** 翻译目标语言。 */
+const TARGET_LANGUAGE = 'zh-CN'
+/** 一次请求合并多少条技能描述：太少费调用、太多容易格式崩，8 是折中。 */
+const TRANSLATE_BATCH = 8
+/** 并发批次数：公共/自建模型都可能限流，压低。 */
+const TRANSLATE_CONCURRENCY = 2
+/** 单次翻译的 maxTokens。 */
+const TRANSLATE_MAX_TOKENS = 4096
 
 /** 按固定并发跑完一组任务，单项失败不影响其他项。 */
 async function mapLimit(items, limit, worker) {
@@ -38,6 +42,29 @@ async function mapLimit(items, limit, worker) {
   return results
 }
 
+/** 把异常折成一行可读文本。 */
+function describe(error) {
+  return `${error?.name ?? 'Error'}: ${error?.message ?? error}`
+}
+
+/** 校验并归一化翻译模型选择。 */
+function normalizeModel(raw) {
+  if (raw === null || typeof raw !== 'object') return null
+  const provider = text(raw.provider, 64).trim()
+  const model = text(raw.model, 128).trim()
+  if (provider === '' || model === '') return null
+  return { provider, model }
+}
+
+/** 从模型输出里抠出 JSON 数组（容忍 ```json 包裹和前后废话）。 */
+function parseJsonArray(raw) {
+  const value = String(raw ?? '')
+  const start = value.indexOf('[')
+  const end = value.lastIndexOf(']')
+  if (start < 0 || end <= start) throw new Error('模型没有返回 JSON 数组')
+  return JSON.parse(value.slice(start, end + 1))
+}
+
 /** 宿主服务：技能分类与中文描述的数据面，同时是客户端唯一的 Remote 入口。 */
 export default class SkillEasyService extends TypertRemoteService {
   static inject = ['skills']
@@ -45,7 +72,7 @@ export default class SkillEasyService extends TypertRemoteService {
   constructor(ctx) {
     super(ctx, 'skillEasy')
     this.ctx = ctx
-    this.store = new DocumentStore(join(resolveDshHome(), 'storages', 'dsh-skill-easy', 'data.json'), ctx.logger)
+    this.store = new DocumentStore(join(resolveDshHome(), 'storages', 'dsh-skill-easy', 'data.v2.json'), ctx.logger)
     this.diagnosticsPath = join(dirname(this.store.path), 'diagnostics.json')
     this.ready = this.store.load().catch((error) => {
       ctx.logger?.warn?.(`dsh-skill-easy: 初始化失败：${error?.message ?? error}`)
@@ -55,89 +82,26 @@ export default class SkillEasyService extends TypertRemoteService {
   }
 
   /**
-   * 取一个可选服务。
-   * 先走 ctx.get（不要求本插件 inject 过），失败再退回属性访问（走 fiber 链）。
-   * 两条路都不通时返回 undefined，绝不让上层因为缺服务而崩。
+   * 取一个可选服务：先 ctx.get，再属性访问，都拿不到返回 undefined，绝不让上层崩。
    * @param name - 服务键。
-   * @returns 服务实例或 undefined。
    */
   service(name) {
     try {
       const value = this.ctx.get(name)
       if (value !== undefined) return value
     } catch (error) {
-      // 忽略：换属性访问再试。
+      // 换属性访问再试。
     }
     try {
       const value = this.ctx[name]
       if (value !== undefined) return value
     } catch (error) {
-      // 忽略：确实拿不到。
+      // 确实拿不到。
     }
     return undefined
   }
 
-  /**
-   * 候选的技能注册表。
-   *
-   * 关键事实：技能 provider 是随 agent 预设挂载的，根上下文那份 `ctx.skills` 往往没有 provider。
-   * 官方 `skills/list` 控制器（session-skill-catalog）的取法是：
-   * `presets.serviceFor(agent, 'skills') ?? ctx.get('skills')`，再 `list({ cwd, scope: agent })`。
-   * 这里照抄，并额外保留几个退化路径，避免没有活跃 agent 时彻底没数据。
-   * @returns `[{ label, registry, options }]`，按优先级排列。
-   */
-  async skillSources() {
-    const sources = []
-    const meta = { codeVersion: CODE_VERSION }
-    try {
-      meta.getSkills = this.ctx.get('skills') !== undefined
-    } catch (error) {
-      meta.getSkills = `throw: ${error?.message ?? error}`
-    }
-    const root = this.service('skills')
-    meta.rootService = root !== undefined
-    try {
-      const agents = this.service('agents')
-      const list = typeof agents?.list === 'function' ? agents.list() : []
-      const live = Array.isArray(list) ? list[0] : undefined
-      meta.agents = Array.isArray(list) ? list.length : -1
-      if (live !== undefined) {
-        let cwd
-        try {
-          const workingDirectory = this.service('workingDirectory')
-          meta.workingDirectory = workingDirectory !== undefined
-          if (workingDirectory !== undefined && typeof workingDirectory.ensure === 'function') {
-            cwd = await workingDirectory.ensure(live)
-          }
-        } catch (error) {
-          meta.cwdError = `${error?.name ?? 'Error'}: ${error?.message ?? error}`
-        }
-        meta.cwd = cwd
-        const presets = this.service('agentPresets')
-        meta.agentPresets = presets !== undefined
-        let scoped
-        try {
-          scoped = typeof presets?.serviceFor === 'function' ? presets.serviceFor(live, 'skills') : undefined
-        } catch (error) {
-          meta.serviceForError = `${error?.name ?? 'Error'}: ${error?.message ?? error}`
-        }
-        meta.presetSkills = scoped !== undefined
-        if (scoped !== undefined) sources.push({ label: 'preset', registry: scoped, options: { cwd, scope: live } })
-        if (root !== undefined) {
-          sources.push({ label: 'root+scope', registry: root, options: { cwd, scope: live } })
-          sources.push({ label: 'root+cwd', registry: root, options: { cwd } })
-        }
-      }
-    } catch (error) {
-      meta.error = `${error?.name ?? 'Error'}: ${error?.message ?? error}`
-      this.ctx.logger?.warn?.(`dsh-skill-easy: 枚举技能来源失败：${meta.error}`)
-    }
-    if (root !== undefined) sources.push({ label: 'root', registry: root, options: {} })
-    meta.labels = sources.map((source) => source.label)
-    return { sources, meta }
-  }
-
-  /** 把一次目录读取的实况落盘，出问题时可以直接看文件，不用靠界面猜。 */
+  /** 把一次目录读取的实况落盘，出问题时直接看文件，不用靠界面猜。 */
   async writeDiagnostics(payload) {
     try {
       await mkdir(dirname(this.diagnosticsPath), { recursive: true })
@@ -148,85 +112,178 @@ export default class SkillEasyService extends TypertRemoteService {
   }
 
   /**
-   * 当前技能目录。只取展示需要的字段，避免把整份定义送到客户端。
-   *
-   * 按优先级逐个来源试，第一个非空的就是结果；全空时把每个来源的尝试结果一并返回，
-   * 同时写一份 diagnostics.json，方便定位是哪一层没拿到。
-   * @returns `{ skills, error, diagnostics }`。
+   * 当前活跃 agent 的 cwd 列表；没有 agent 时给 [undefined]（只读全局层）。
+   * @returns {Promise<(string|undefined)[]>}
    */
-  async catalog() {
-    const { sources, meta } = await this.skillSources()
-    const diagnostics = []
-    let empty = null
-    let lastError = null
-    for (const source of sources) {
-      try {
-        const skills = await source.registry.list(source.options)
-        const mapped = skills
-          .map((skill) => ({
-            name: skill.name,
-            description: skill.description,
-            srcHash: hashOf(skill.description),
-            modelInvocable: skill.invocation?.modelInvocable !== false,
-            userInvocable: skill.invocation?.userInvocable !== false,
-            source: skill.source,
-            ...(skill.path === undefined ? {} : { path: skill.path }),
-          }))
-          // 只保留能在 `/` 菜单里出现的技能，避免设置页里出现点了也用不了的条目。
-          .filter((skill) => skill.userInvocable)
-          .sort((left, right) => left.name.localeCompare(right.name))
-        diagnostics.push(`${source.label}: ${mapped.length}`)
-        if (mapped.length > 0) {
-          await this.writeDiagnostics({ ...meta, at: new Date().toISOString(), attempts: diagnostics, count: mapped.length })
-          return { skills: mapped, error: null, diagnostics }
+  async activeCwds() {
+    const cwds = new Set()
+    try {
+      const agents = this.service('agents')
+      const workingDirectory = this.service('workingDirectory')
+      const list = typeof agents?.list === 'function' ? agents.list() : []
+      for (const agent of Array.isArray(list) ? list : []) {
+        try {
+          const cwd = workingDirectory?.get?.(agent?.session)
+          if (typeof cwd === 'string' && cwd !== '') cwds.add(cwd)
+        } catch (error) {
+          // 单个 agent 取不到 cwd 不影响整体。
         }
-        empty = mapped
-      } catch (error) {
-        const reason = `${error?.name ?? 'Error'}: ${error?.message ?? error}`
-        lastError = reason
-        diagnostics.push(`${source.label}: 失败 ${reason}`)
-        this.ctx.logger?.warn?.(`dsh-skill-easy: 读取技能目录失败（${source.label}）：${reason}`)
       }
+    } catch (error) {
+      // agents 服务不可用不致命。
     }
-    const result = { skills: empty ?? [], error: empty === null ? lastError : null, diagnostics }
-    await this.writeDiagnostics({ ...meta, at: new Date().toISOString(), attempts: diagnostics, count: result.skills.length })
-    return result
+    return cwds.size > 0 ? [...cwds] : [undefined]
   }
 
-  /** 翻译服务状态：不可用时客户端只提供手动填写，不报错。 */
-  async translatorState() {
-    const translator = this.service('translator')
-    if (translator === undefined) return { available: false, reason: 'translator-unavailable', providers: [] }
+  /**
+   * 完整技能并集：遍历所有预设的 scope（含全局层）取并集，再兜底全局。
+   * 关键：不用依赖活跃 agent，也不会再出现「只有 6 个」的残缺列表。
+   * @returns {{ skills: object[], diagnostics: string[] }}
+   */
+  async catalog() {
+    const diagnostics = []
+    const seen = new Map()
+    const put = (skill) => {
+      const name = typeof skill?.name === 'string' ? skill.name.trim() : ''
+      if (name === '') return
+      const previous = seen.get(name)
+      // 同名（跨预设）合并，优先保留有描述的版本。
+      if (previous === undefined || (typeof previous.description !== 'string' || previous.description === '') && typeof skill.description === 'string' && skill.description !== '') {
+        seen.set(name, skill)
+      }
+    }
+
+    const skills = this.service('skills')
+    const presets = this.service('agentPresets')
+    const cwds = await this.activeCwds()
+
+    if (skills !== undefined) {
+      if (presets !== undefined && typeof presets.list === 'function') {
+        let roster = []
+        try {
+          roster = await presets.list()
+        } catch (error) {
+          diagnostics.push(`presets.list 失败 ${describe(error)}`)
+        }
+        for (const preset of Array.isArray(roster) ? roster : []) {
+          if (preset === null || typeof preset !== 'object' || preset.broken !== undefined) continue
+          let lease = null
+          try {
+            lease = await presets.acquireScope(preset.id)
+            for (const cwd of cwds) {
+              try {
+                const list = await skills.list(cwd === undefined ? { scope: lease.key } : { scope: lease.key, cwd })
+                for (const skill of Array.isArray(list) ? list : []) put(skill)
+              } catch (error) {
+                diagnostics.push(`preset ${preset.id}${cwd ? ` @cwd` : ''}: ${describe(error)}`)
+              }
+            }
+          } catch (error) {
+            diagnostics.push(`preset ${preset.id} scope: ${describe(error)}`)
+          } finally {
+            try {
+              const dispose = lease?.[Symbol.asyncDispose]
+              if (typeof dispose === 'function') await dispose.call(lease)
+            } catch (error) {
+              // 释放失败忽略。
+            }
+          }
+        }
+      }
+      // 全局兜底：scope 省略时只读全局层，保证哪怕没有预设也有数据。
+      for (const cwd of cwds) {
+        try {
+          const list = await skills.list(cwd === undefined ? {} : { cwd })
+          for (const skill of Array.isArray(list) ? list : []) put(skill)
+        } catch (error) {
+          diagnostics.push(`root${cwd ? ' @cwd' : ''}: ${describe(error)}`)
+        }
+      }
+    } else {
+      diagnostics.push('skills 服务不可用')
+    }
+
+    const mapped = [...seen.values()]
+      .map((skill) => ({
+        name: skill.name,
+        description: typeof skill.description === 'string' ? skill.description : '',
+        srcHash: hashOf(skill.description ?? ''),
+        modelInvocable: skill.invocation?.modelInvocable !== false,
+        userInvocable: skill.invocation?.userInvocable !== false,
+        ...(skill.source === undefined ? {} : { source: skill.source }),
+        ...(skill.path === undefined ? {} : { path: skill.path }),
+        ...(typeof skill.whenToUse === 'string' ? { whenToUse: skill.whenToUse } : {}),
+      }))
+      // 只保留能在 `/` 菜单里出现的技能，避免设置页出现点了也用不了的条目。
+      .filter((skill) => skill.userInvocable)
+      .sort((left, right) => left.name.localeCompare(right.name))
+
+    await this.writeDiagnostics({ at: new Date().toISOString(), count: mapped.length, diagnostics })
+    return { skills: mapped, diagnostics }
+  }
+
+  /**
+   * 可用的翻译模型：把各家 provider 的模型摊平成一张清单，附带当前默认选择。
+   * @returns 模型视图，失败时 available=false 但不抛。
+   */
+  async llmState() {
+    const llm = this.service('llm')
+    if (llm === undefined) return { available: false, reason: 'llm-unavailable', providers: [], models: [], defaultModel: null }
+    let providers = []
     try {
-      const providers = await translator.availableProviders()
-      const names = (Array.isArray(providers) ? providers : []).map((entry) => {
-        if (typeof entry === 'string') return entry
-        return String(entry?.provider ?? entry?.id ?? entry?.name ?? '')
-      })
-      return { available: names.length > 0, reason: names.length > 0 ? null : 'no-provider', providers: names }
+      providers = llm.listProviders()
     } catch (error) {
-      return { available: false, reason: error?.message ?? 'translator-error', providers: [] }
+      return { available: false, reason: describe(error), providers: [], models: [], defaultModel: null }
+    }
+    const models = []
+    for (const provider of Array.isArray(providers) ? providers : []) {
+      try {
+        const list = await llm.listModels(provider.id)
+        for (const model of Array.isArray(list) ? list : []) {
+          models.push({ provider: provider.id, providerName: provider.name ?? provider.id, id: model.id, name: model.name ?? model.id })
+        }
+      } catch (error) {
+        // 某家 provider 列不出模型就跳过。
+      }
+    }
+    let defaultModel = null
+    try {
+      const selection = this.service('agentDefaultModel')?.currentSelection?.()
+      if (selection && typeof selection.provider === 'string' && typeof selection.model === 'string') {
+        defaultModel = { provider: selection.provider, model: selection.model }
+      }
+    } catch (error) {
+      // 默认模型读不到就不设默认。
+    }
+    return {
+      available: models.length > 0,
+      reason: models.length > 0 ? null : 'no-model',
+      providers: (Array.isArray(providers) ? providers : []).map((provider) => ({ id: provider.id, name: provider.name ?? provider.id })),
+      models,
+      defaultModel,
     }
   }
 
   /**
-   * 客户端首屏：一次拿齐文档、技能目录、翻译能力。
+   * 客户端首屏：一次拿齐文档、技能并集、翻译模型。
    * @returns 完整视图。
    */
   async overview() {
     await this.ready
-    // 必须取内存里的当前数据：`this.ready` 只是启动时那次读盘的结果，保存后不会变。
     const document = this.store.snapshot()
-    const [catalog, translator] = await Promise.all([this.catalog(), this.translatorState()])
-    return { document, codeVersion: CODE_VERSION, skills: catalog.skills, catalogError: catalog.error, catalogDiagnostics: catalog.diagnostics, translator }
+    const [catalog, llm] = await Promise.all([this.catalog(), this.llmState()])
+    return {
+      document,
+      codeVersion: CODE_VERSION,
+      skills: catalog.skills,
+      catalogDiagnostics: catalog.diagnostics,
+      llm,
+    }
   }
 
   /**
    * 整份保存。数据量只有几十条，整体覆盖比增量合并更不容易出错。
-   *
-   * 乐观锁在 DocumentStore 里实现，比较对象是内存里的当前文档。
    * @param request - `{ document, baseRev? }`。
-   * @returns `{ ok: true, document }` 或 `{ ok: false, reason, document? }`。
    */
   async save(request) {
     await this.ready
@@ -238,53 +295,117 @@ export default class SkillEasyService extends TypertRemoteService {
     }
   }
 
+  /** 用一次大模型调用完成一批翻译，返回 Map<name, zh>。 */
+  async translateBatch(model, batch) {
+    const llm = this.service('llm')
+    const system = '你是专业的技术文档翻译。把每个技能描述翻译成简洁、准确、自然的中文，保留专有名词（如 DSH、PR、API、Git）不译，不要加解释。只返回 JSON 数组。'
+    const lines = batch.map((item, index) => `${index + 1}. ${item.description}`).join('\n')
+    const user = `把下面 ${batch.length} 条技能描述逐条翻译成简体中文。\n返回严格 JSON 数组，元素形如 {"i":序号,"zh":"译文"}，序号对应上面的 1..${batch.length}，不要输出任何多余文字。\n\n${lines}`
+    const prepared = await llm.prepareCall({ provider: model.provider, model: model.model, maxTokens: TRANSLATE_MAX_TOKENS })
+    let raw = ''
+    const stream = prepared.stream({
+      ...prepared.config,
+      system,
+      messages: [{ role: 'user', content: [{ type: 'text', text: user }] }],
+    })
+    for await (const chunk of stream) {
+      if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') raw += chunk.text
+    }
+    const parsed = parseJsonArray(raw)
+    const byName = new Map()
+    for (const entry of Array.isArray(parsed) ? parsed : []) {
+      if (entry === null || typeof entry !== 'object') continue
+      const position = Number(entry.i)
+      const index = Number.isInteger(position) ? position - 1 : -1
+      const item = batch[index]
+      if (item === undefined) continue
+      const zh = text(String(entry.zh ?? '').replace(/\s+/g, ' ').trim(), MAX_ZH)
+      if (zh !== '') byName.set(item.name, zh)
+    }
+    return byName
+  }
+
+  /** 单条翻译（批量失败时的兜底）。 */
+  async translateOne(model, description) {
+    const llm = this.service('llm')
+    const system = '你是专业的技术文档翻译。把技能描述翻译成简洁、准确、自然的中文，保留专有名词不译，只输出译文本身。'
+    const prepared = await llm.prepareCall({ provider: model.provider, model: model.model, maxTokens: TRANSLATE_MAX_TOKENS })
+    let raw = ''
+    const stream = prepared.stream({
+      ...prepared.config,
+      system,
+      messages: [{ role: 'user', content: [{ type: 'text', text: description }] }],
+    })
+    for await (const chunk of stream) {
+      if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') raw += chunk.text
+    }
+    return text(String(raw).replace(/\s+/g, ' ').trim(), MAX_ZH)
+  }
+
   /**
-   * 翻译指定技能的英文描述。
-   * 逐条独立：某条失败只进 failures，其余照常返回。
-   * @param request - `{ names?: string[] }`，省略表示翻译全部有英文描述的技能。
-   * @returns `{ results, failures, translator }`。
+   * 翻译指定技能的英文描述。逐条/逐批独立：某条失败只进 failures，其余照常返回。
+   * @param request - `{ names?: string[], skills?: {name,description}[], model?: {provider,model} }`。
    */
   async translate(request) {
     await this.ready
     const document = this.store.snapshot()
-    // 客户端已经拿到了 `/` 菜单同源的技能清单，优先用它；没有才退回自己读。
     const provided = Array.isArray(request?.skills)
       ? request.skills.filter((skill) => skill !== null && typeof skill === 'object' && typeof skill.name === 'string')
       : null
     const catalog = provided === null ? (await this.catalog()).skills : provided
     const byName = new Map(catalog.map((skill) => [skill.name, skill]))
     const wanted = Array.isArray(request?.names) && request.names.length > 0
-      ? request.names.filter((name) => byName.has(name))
+      ? request.names.filter((name) => typeof name === 'string' && byName.has(name))
       : catalog.map((skill) => skill.name)
-    const translator = this.service('translator')
-    if (translator === undefined) {
-      return { results: [], failures: wanted.map((name) => ({ name, reason: 'translator-unavailable' })), translator: { available: false, reason: 'translator-unavailable', providers: [] } }
+
+    const llm = this.service('llm')
+    const state = await this.llmState()
+    const model = normalizeModel(request?.model) ?? document.options.translateModel ?? state.defaultModel
+    if (llm === undefined || model === null) {
+      const reason = llm === undefined ? 'llm-unavailable' : 'no-model'
+      return { results: [], failures: wanted.map((name) => ({ name, reason })), document: this.store.snapshot(), model, llm: state }
     }
 
-    const outcomes = await mapLimit(wanted, TRANSLATE_CONCURRENCY, async (name) => {
-      const skill = byName.get(name)
-      const description = String(skill?.description ?? '').trim()
-      if (description === '') return { name, reason: 'empty-description' }
+    const items = wanted.map((name) => ({
+      name,
+      description: String(byName.get(name)?.description ?? '').trim(),
+    }))
+    const results = []
+    const failures = []
+    const withText = []
+    for (const item of items) {
+      if (item.description === '') failures.push({ name: item.name, reason: 'empty-description' })
+      else withText.push(item)
+    }
+
+    const batches = []
+    for (let index = 0; index < withText.length; index += TRANSLATE_BATCH) batches.push(withText.slice(index, index + TRANSLATE_BATCH))
+
+    await mapLimit(batches, TRANSLATE_CONCURRENCY, async (batch) => {
       try {
-        const spec = translator.resolve({ text: description, targetLanguage: TARGET_LANGUAGE, sourceLanguage: 'en' })
-        const translated = await translator.translate(spec)
-        const zh = text(String(translated ?? '').replace(/\s+/g, ' ').trim(), MAX_ZH)
-        if (zh === '') return { name, reason: 'empty-translation' }
-        return { name, zh, srcHash: hashOf(description) }
+        const translated = await this.translateBatch(model, batch)
+        for (const item of batch) {
+          const zh = translated.get(item.name)
+          if (typeof zh === 'string' && zh !== '') results.push({ name: item.name, zh, srcHash: hashOf(item.description) })
+          else failures.push({ name: item.name, reason: 'missing-translation' })
+        }
       } catch (error) {
-        return { name, reason: error?.code ?? error?.message ?? 'translate-failed' }
+        // 整批失败：退回逐条，尽量救回来。
+        for (const item of batch) {
+          try {
+            const zh = await this.translateOne(model, item.description)
+            if (zh !== '') results.push({ name: item.name, zh, srcHash: hashOf(item.description) })
+            else failures.push({ name: item.name, reason: 'empty-translation' })
+          } catch (singleError) {
+            failures.push({ name: item.name, reason: singleError?.code ?? singleError?.message ?? 'translate-failed' })
+          }
+        }
       }
     })
 
-    const results = []
-    const failures = []
-    for (const outcome of outcomes) {
-      if (outcome !== undefined && typeof outcome.zh === 'string') results.push(outcome)
-      else if (outcome !== undefined) failures.push({ name: outcome.name, reason: outcome.reason })
-    }
-    // 翻译结果顺手落盘，避免客户端还没保存就丢了。
-    if (results.length > 0) {
-      const next = { ...document, skills: { ...document.skills } }
+    // 翻译结果顺手落盘，避免客户端还没保存就丢了；同时记住这次用的模型。
+    if (results.length > 0 || model !== null) {
+      const next = { ...document, skills: { ...document.skills }, options: { ...document.options, translateModel: model } }
       for (const entry of results) {
         const current = next.skills[entry.name] ?? {}
         next.skills[entry.name] = { ...current, zh: entry.zh, srcHash: entry.srcHash }
@@ -295,8 +416,7 @@ export default class SkillEasyService extends TypertRemoteService {
         this.ctx.logger?.warn?.(`dsh-skill-easy: 翻译结果保存失败：${error?.message ?? error}`)
       }
     }
-    const translatorState = await this.translatorState()
-    return { results, failures, document: this.store.snapshot(), translator: translatorState }
+    return { results, failures, document: this.store.snapshot(), model, llm: await this.llmState() }
   }
 
   /**

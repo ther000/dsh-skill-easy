@@ -1,9 +1,9 @@
 {
   "name": "dsh-skill-easy",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "把 / 菜单里的技能按自定义分类分段，并用中文显示描述",
+  "description": "给 / 菜单里的技能分类、写中文描述，并用你自己配置的大模型批量翻译",
   "license": "MIT",
   "scripts": {
     "test": "node --test test/menu.test.mjs test/store.test.mjs",
@@ -30,7 +30,7 @@
     },
     "meta": {
       "title": "技能分类 · Skill Easy",
-      "description": "给技能分类、写中文描述，让 / 菜单一眼能看懂"
+      "description": "给技能分组、写中文描述，用你的大模型批量翻译，/ 菜单按分类分段显示"
     },
     "client": {
       "platform": "web",

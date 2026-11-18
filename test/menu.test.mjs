@@ -1,9 +1,8 @@
 /**
- * / 菜单增强的回归用例。
+ * / 菜单源 + 保存逻辑的回归用例。
  *
- * 这一层没有 UI 可断言，能测的是纯逻辑：候选列表被改写后是否
- * 按分类分段、中文描述是否生效、没有分类时是否保持官方顺序。
- * 顺带验证 client.js 能被模块加载器解析、apply 能装到假的 ctx 上。
+ * 新实现走公开的 `inputTriggers.registerSource` 注册自己的 `/` 源（不再猴补官方 source）。
+ * 这里测的是纯逻辑 + 注册行为：候选如何按分类分段、隐藏是否生效、中文是否替换、搜索是否过滤。
  *
  * 运行：node --test test/
  */
@@ -30,7 +29,6 @@ const React = {
 function loadModule() {
   let definition
   globalThis.window = { __ModuleLoader__: { load: (value) => { definition = value } } }
-  // eslint-disable-next-line no-new-func
   const run = new Function('window', 'require', clientSource)
   run(globalThis.window, (name) => {
     if (name === 'react') return React
@@ -39,20 +37,11 @@ function loadModule() {
   return definition
 }
 
-/** 造一个只有菜单相关部分的客户端 ctx。 */
+const EMPTY = { version: 2, rev: 0, categories: [], skills: {}, options: { menuChinese: true, translateModel: null } }
+
+/** 造一个客户端 ctx；记录 registerSource 注册上来的源。 */
 function createHarness(options = {}) {
-  const source = {
-    trigger: '/',
-    name: 'skill',
-    order: 2,
-    async candidates() {
-      return [
-        { name: 'check', description: 'Reviews diffs, PRs, release readiness.' },
-        { name: 'agent-experience', description: 'Use when writing a model-facing tool definition.' },
-        { name: 'domain-modeling', description: 'Build and sharpen a project domain model.' },
-      ]
-    },
-  }
+  const sources = []
   const ctx = {
     effects: [],
     effect(fn) {
@@ -61,161 +50,146 @@ function createHarness(options = {}) {
       return dispose
     },
     get(name) {
-      if (name === 'inputTriggers') return { live: { sources: [source] } }
+      if (name === 'inputTriggers') {
+        return {
+          registerSource(source) {
+            sources.push(source)
+            return () => {}
+          },
+        }
+      }
       if (name === 'remote.skillEasy') return ctx.remote.skillEasy
       return undefined
     },
     inject(deps, callback) {
-      // 假 ctx：依赖总是就绪，立刻回调。
       callback(this)
       return { dispose: () => {} }
     },
     locale: {
-      register() {
-        return () => {}
-      },
+      register() { return () => {} },
       bind() {
-        return (key) => (key === 'uncategorized' ? '未分类' : key === 'userOnly' ? '仅用户' : key)
+        return (key) => ({ uncategorized: '未分类', userOnly: '仅用户' }[key] ?? key)
       },
     },
-    slots: {
-      inject() {},
-      register() {
-        return () => {}
-      },
-    },
+    slots: { inject() {}, register() { return () => {} } },
     remote: {
       async $mount() {},
       skillEasy: {
         async overview() {
           return {
-            document: options.document ?? { version: 1, categories: [], skills: {}, options: { menuChinese: true } },
-            skills: [
-              { name: 'check', description: 'Reviews diffs, PRs, release readiness.', srcHash: 'h-check', modelInvocable: true },
-              { name: 'agent-experience', description: 'Use when writing a model-facing tool definition.', srcHash: 'h-agent', modelInvocable: true },
-              { name: 'domain-modeling', description: 'Build and sharpen a project domain model.', srcHash: 'h-domain', modelInvocable: false },
+            document: options.document ?? EMPTY,
+            skills: options.skills ?? [
+              { name: 'check', description: 'Reviews diffs, PRs, release readiness.', srcHash: 'h-check', modelInvocable: true, userInvocable: true },
+              { name: 'agent-experience', description: 'Use when writing a model-facing tool definition.', srcHash: 'h-agent', modelInvocable: true, userInvocable: true },
+              { name: 'domain-modeling', description: 'Build and sharpen a project domain model.', srcHash: 'h-domain', modelInvocable: false, userInvocable: true },
             ],
-            translator: { available: true, reason: null, providers: ['bing'] },
+            codeVersion: 1,
+            catalogDiagnostics: [],
+            llm: { available: true, reason: null, providers: [{ id: 'p', name: 'P' }], models: [{ provider: 'p', providerName: 'P', id: 'm', name: 'M' }], defaultModel: { provider: 'p', model: 'm' } },
           }
         },
-        async save(request) {
-          return { ok: true, document: request.document }
-        },
-        async translate() {
-          return { results: [], failures: [], document: null, translator: { available: true, providers: [] } }
-        },
-        async reset() {
-          return { ok: true, document: { version: 1, categories: [], skills: {}, options: { menuChinese: true } } }
-        },
+        async save(request) { return { ok: true, document: request.document } },
+        async translate() { return { results: [], failures: [], document: null, llm: { available: true, models: [] } } },
+        async reset() { return { ok: true, document: EMPTY } },
       },
     },
   }
-  return { ctx, source }
+  return { ctx, sources }
 }
 
-/** 等首屏数据落地（overview 是异步的）。 */
 async function settle() {
-  for (let index = 0; index < 20; index += 1) await Promise.resolve()
-  await new Promise((resolve) => setTimeout(resolve, 5))
+  for (let index = 0; index < 40; index += 1) await Promise.resolve()
+  await new Promise((resolve) => setTimeout(resolve, 10))
 }
 
-test('没有分类时不加 section，只换中文描述', async () => {
+test('模块元信息与注入声明', () => {
   const definition = loadModule()
   assert.equal(definition.id, 'dsh-skill-easy')
   assert.deepEqual(definition.factory(() => React).inject, ['slots', 'locale', 'remote'])
+})
 
-  const { ctx, source } = createHarness({
-    document: {
-      version: 1,
-      categories: [],
-      skills: { check: { zh: '审查改动与发布就绪度', srcHash: 'h-check' } },
-      options: { menuChinese: true },
-    },
-  })
-  const plugin = definition.factory((name) => {
-    if (name === 'react') return React
-    throw new Error(`unexpected require: ${name}`)
-  })
-  plugin.apply(ctx)
-  await settle()
-
-  const items = await source.candidates({ sessionId: 's1' }, { query: '' })
-  assert.deepEqual(items.map((item) => item.name), ['check', 'agent-experience', 'domain-modeling'])
-  assert.equal(items[0].description, '审查改动与发布就绪度')
-  assert.equal(items[1].description, 'Use when writing a model-facing tool definition.')
+test('buildMenuItems：无分类时不加 section，只换中文描述', () => {
+  const { buildMenuItems } = loadModule().factory(() => React).__test
+  const t = (key) => ({ uncategorized: '未分类', userOnly: '仅用户' }[key] ?? key)
+  const skills = [
+    { name: 'check', description: 'Reviews diffs.', modelInvocable: true },
+    { name: 'hunt', description: 'Find root cause.', modelInvocable: true },
+  ]
+  const doc = { categories: [], skills: { check: { zh: '审查改动', srcHash: 'h' } }, options: { menuChinese: true } }
+  const items = buildMenuItems(skills, doc, t, '')
+  assert.deepEqual(items.map((item) => item.name), ['check', 'hunt'])
+  assert.equal(items[0].description, '审查改动')
   assert.equal(items[0].section, undefined)
 })
 
-test('有分类时按分类顺序分段，未归类的排最后', async () => {
-  const definition = loadModule()
-  const { ctx, source } = createHarness({
-    document: {
-      version: 1,
-      categories: [{ id: 'review', name: '审查', order: 10 }],
-      skills: {
-        check: { categoryId: 'review', zh: '审查改动', srcHash: 'h-check' },
-        'domain-modeling': { zh: '领域建模', srcHash: 'h-domain' },
-      },
-      options: { menuChinese: true },
+test('buildMenuItems：按分类顺序分段，未归类排最后，隐藏项剔除，仅用户加标记', () => {
+  const { buildMenuItems } = loadModule().factory(() => React).__test
+  const t = (key) => ({ uncategorized: '未分类', userOnly: '仅用户' }[key] ?? key)
+  const skills = [
+    { name: 'check', description: 'Reviews diffs.', modelInvocable: true },
+    { name: 'agent-experience', description: 'Tool defs.', modelInvocable: true },
+    { name: 'domain-modeling', description: 'Domain model.', modelInvocable: false },
+    { name: 'secret', description: 'Hidden one.', modelInvocable: true },
+  ]
+  const doc = {
+    categories: [{ id: 'review', name: '审查', order: 10 }, { id: 'dev', name: '开发', order: 20 }],
+    skills: {
+      check: { categoryId: 'review', zh: '审查改动', srcHash: 'h' },
+      'agent-experience': { categoryId: 'dev', zh: '工具定义', srcHash: 'h' },
+      'domain-modeling': { zh: '领域建模', srcHash: 'h' },
+      secret: { hidden: true },
     },
-  })
-  const plugin = definition.factory((name) => {
-    if (name === 'react') return React
-    throw new Error(`unexpected require: ${name}`)
-  })
-  plugin.apply(ctx)
-  await settle()
-
-  const items = await source.candidates({ sessionId: 's1' }, { query: '' })
+    options: { menuChinese: true },
+  }
+  const items = buildMenuItems(skills, doc, t, '')
   assert.deepEqual(items.map((item) => item.name), ['check', 'agent-experience', 'domain-modeling'])
   assert.equal(items[0].section, '审查')
-  assert.equal(items[0].description, '审查改动')
-  assert.equal(items[1].section, '未分类')
+  assert.equal(items[1].section, '开发')
   assert.equal(items[2].section, '未分类')
-  // 仅用户可调用的技能保留标记
   assert.equal(items[2].description, '仅用户 · 领域建模')
 })
 
-test('没有中文描述时完全沿用官方候选', async () => {
+test('buildMenuItems：查询按名字/中文过滤', () => {
+  const { buildMenuItems } = loadModule().factory(() => React).__test
+  const t = (key) => ({ uncategorized: '未分类', userOnly: '仅用户' }[key] ?? key)
+  const skills = [{ name: 'check', description: 'Reviews diffs.' }, { name: 'hunt', description: 'Root cause.' }]
+  const doc = { categories: [], skills: { check: { zh: '审查改动' } }, options: { menuChinese: true } }
+  assert.deepEqual(buildMenuItems(skills, doc, t, '审查').map((item) => item.name), ['check'])
+  assert.deepEqual(buildMenuItems(skills, doc, t, 'hunt').map((item) => item.name), ['hunt'])
+})
+
+test('apply 走公开 registerSource 注册自己的 / 源，候选可分组', async () => {
   const definition = loadModule()
-  const { ctx, source } = createHarness()
-  const plugin = definition.factory((name) => {
-    if (name === 'react') return React
-    throw new Error(`unexpected require: ${name}`)
+  const { ctx, sources } = createHarness({
+    document: {
+      version: 2,
+      rev: 1,
+      categories: [{ id: 'review', name: '审查', order: 10 }],
+      skills: { check: { categoryId: 'review', zh: '审查改动', srcHash: 'h' } },
+      options: { menuChinese: true, translateModel: null },
+    },
   })
+  const plugin = definition.factory((name) => { if (name === 'react') return React; throw new Error(name) })
   plugin.apply(ctx)
   await settle()
 
+  assert.equal(sources.length, 1, '应只注册一个 / 源')
+  const source = sources[0]
+  assert.equal(source.trigger, '/')
+  assert.equal(source.name, 'skill-easy')
+  assert.equal(source.showGroupTitle, false)
   const items = await source.candidates({ sessionId: 's1' }, { query: '' })
-  assert.deepEqual(items.map((item) => item.name), ['check', 'agent-experience', 'domain-modeling'])
-  assert.equal(items[0].description, 'Reviews diffs, PRs, release readiness.')
-  assert.equal(items[0].section, undefined)
-})
-
-test('找不到官方 source 时不抛错，标记菜单未生效', async () => {
-  const definition = loadModule()
-  const { ctx } = createHarness()
-  ctx.get = () => undefined
-  const plugin = definition.factory((name) => {
-    if (name === 'react') return React
-    throw new Error(`unexpected require: ${name}`)
-  })
-  assert.doesNotThrow(() => plugin.apply(ctx))
-  await settle()
+  assert.equal(items[0].name, 'check')
+  assert.equal(items[0].section, '审查')
+  assert.equal(items[0].description, '审查改动')
+  // onPick 返回 /name 以便宿主注入技能体
+  assert.deepEqual(source.onPick({ candidate: { name: 'check' } }), { text: '/check ' })
 })
 
 test('保存冲突：先按最新 rev 重试，重试仍冲突才采纳服务端（回归：改名被回滚）', () => {
-  const definition = loadModule()
-  const { planSave } = definition.factory((name) => {
-    if (name === 'react') return React
-    throw new Error(`unexpected require: ${name}`)
-  }).__test
-
+  const { planSave } = loadModule().factory(() => React).__test
   assert.equal(planSave({ ok: true, document: { rev: 3 } }, false, 0), 'done')
-  // 回归点：旧实现把任何 stale 都当成「别人改过」直接采纳服务端文档，
-  // 于是用户自己上一次保存推进 rev 后，下一次改名会被回滚。
   assert.equal(planSave({ ok: false, reason: 'stale', document: { rev: 9 } }, false, 9), 'retry')
-  // 真冲突：服务端版本比自己写的还新，采纳服务端文档才对。
   assert.equal(planSave({ ok: false, reason: 'stale', document: { rev: 10 } }, false, 9), 'adopt')
   assert.equal(planSave({ ok: false, reason: 'stale', document: { rev: 9 } }, true, 9), 'adopt')
   assert.equal(planSave({ ok: false, reason: 'save-failed' }, false, 9), 'error')
@@ -223,12 +197,7 @@ test('保存冲突：先按最新 rev 重试，重试仍冲突才采纳服务端
 })
 
 test('中文过期判断用的哈希稳定且对内容敏感', () => {
-  const definition = loadModule()
-  const { hashOf } = definition.factory((name) => {
-    if (name === 'react') return React
-    throw new Error(`unexpected require: ${name}`)
-  }).__test
-
+  const { hashOf } = loadModule().factory(() => React).__test
   assert.equal(hashOf('same text'), hashOf('same text'))
   assert.notEqual(hashOf('same text'), hashOf('same text.'))
   assert.match(hashOf(''), /^[0-9a-f]{8}$/)
@@ -249,4 +218,3 @@ test('设置页用到的每个 class 都在 SETTINGS_CSS 里有定义', () => {
     assert.ok(css.includes(`.${name}`), `设置页用了 .${name} 但样式里没有定义`)
   }
 })
-

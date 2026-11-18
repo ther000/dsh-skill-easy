@@ -10,16 +10,16 @@ import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { DocumentStore, emptyDocument, normalizeDocument } from '../store.js'
+import { DATA_VERSION, DocumentStore, emptyDocument, normalizeDocument } from '../store.js'
 
 /** 造一份只有分类的文档，省得每处都写全字段。 */
 function doc(rev, names) {
   return {
-    version: 1,
+    version: DATA_VERSION,
     rev,
     categories: names.map((name, index) => ({ id: `c${index + 1}`, name, order: (index + 1) * 10 })),
     skills: {},
-    options: { menuChinese: true },
+    options: { menuChinese: true, translateModel: null },
   }
 }
 
@@ -60,7 +60,7 @@ test('连续保存：第二次带最新 rev 必须成功（回归：rev 比较�
   }
 })
 
-test('归一化：空名分类和悬空分类引用被丢弃，合法条目保留', () => {
+test('归一化：空名分类、悬空分类引用、越界值都安全处理，合法条目与隐藏/排序保留', () => {
   const normalized = normalizeDocument({
     rev: 5,
     categories: [
@@ -69,19 +69,32 @@ test('归一化：空名分类和悬空分类引用被丢弃，合法条目保�
       { id: 'c1', name: '重复', order: 30 },
     ],
     skills: {
-      check: { categoryId: 'c1', zh: '审查改动', srcHash: 'abcd1234' },
+      check: { categoryId: 'c1', zh: '审查改动', srcHash: 'abcd1234', hidden: true, order: 20 },
       hunt: { categoryId: 'missing', zh: '' },
       '': { zh: '无效名字' },
+      mole: { hidden: false, order: 5 },
     },
-    options: { menuChinese: false },
+    options: { menuChinese: false, translateModel: { provider: 'deepseek-official', model: 'deepseek-flash' } },
   })
 
+  assert.equal(normalized.version, DATA_VERSION)
   assert.equal(normalized.rev, 5)
   assert.deepEqual(normalized.categories.map((category) => category.name), ['写作'])
   assert.equal(normalized.skills.check.categoryId, 'c1')
   assert.equal(normalized.skills.check.zh, '审查改动')
+  assert.equal(normalized.skills.check.hidden, true)
+  assert.equal(normalized.skills.check.order, 20)
+  // 悬空分类引用被丢弃；hidden:false 不落库，只保留 order
   assert.equal(normalized.skills.hunt, undefined)
+  assert.deepEqual(normalized.skills.mole, { order: 5 })
   assert.equal(normalized.options.menuChinese, false)
+  assert.deepEqual(normalized.options.translateModel, { provider: 'deepseek-official', model: 'deepseek-flash' })
+})
+
+test('翻译模型缺字段或非法时归成 null', () => {
+  assert.equal(normalizeDocument({ options: { translateModel: { provider: 'x' } } }).options.translateModel, null)
+  assert.equal(normalizeDocument({ options: { translateModel: null } }).options.translateModel, null)
+  assert.equal(normalizeDocument({ options: {} }).options.translateModel, null)
 })
 
 test('空文档起始 rev 为 0，保存后递增', async () => {
@@ -90,6 +103,7 @@ test('空文档起始 rev 为 0，保存后递增', async () => {
     const store = new DocumentStore(join(dir, 'data.json'))
     await store.load()
     assert.equal(store.snapshot().rev, 0)
+    assert.deepEqual(store.snapshot(), emptyDocument())
     const saved = await store.save({ document: { ...store.snapshot(), ...doc(0, ['写作']) }, baseRev: 0 })
     assert.equal(saved.ok, true)
     assert.equal(saved.document.rev, 1)

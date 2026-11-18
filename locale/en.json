@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "Skill Groups",
-    "description": "Group skills in the / menu by your own categories and show Chinese descriptions instead of the English text."
+    "title": "Skill Groups & Chinese Descriptions",
+    "description": "Group skills, write Chinese descriptions, batch-translate with your own configured LLM, and show the / menu grouped by group."
   }
 }
